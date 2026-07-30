@@ -137,6 +137,24 @@ type Snapshot struct {
 	Active  []Run
 	Recent  []Run
 	TakenAt time.Time
+	// Baselines is the typical duration of each step, learned from this
+	// machine's own finished runs. It is what makes "how much longer" an
+	// answer rather than a guess.
+	Baselines Baselines
+}
+
+// Baselines holds a typical step duration per repository and step name.
+type Baselines map[string]time.Duration
+
+// baselineKey scopes a duration to one repo's copy of one step. A test step
+// means something different in every project, so they must never be averaged
+// together.
+func baselineKey(repoPath, stepName string) string { return repoPath + "\x00" + stepName }
+
+// Lookup returns the typical duration of a step in a repo.
+func (b Baselines) Lookup(repoPath, stepName string) (time.Duration, bool) {
+	d, ok := b[baselineKey(repoPath, stepName)]
+	return d, ok
 }
 
 // Run is one pipeline run with its steps.
@@ -166,7 +184,8 @@ type Step struct {
 	Duration       time.Duration
 	LogPath        string
 	Error          string
-	Findings       int
+	Findings       []Finding
+	FindingCount   int
 	NeedsUser      int
 	Summary        string
 	StartedAt      time.Time
@@ -174,6 +193,41 @@ type Step struct {
 	LastActivity   string
 	LastActivityAt time.Time
 	AgentPID       int
+}
+
+// Finding is one thing a step flagged: a review comment, a failing test, a lint
+// complaint. Action is what the pipeline decided to do about it.
+type Finding struct {
+	Severity    string `json:"severity"`
+	File        string `json:"file"`
+	Line        int    `json:"line"`
+	Description string `json:"description"`
+	Action      string `json:"action"`
+	Category    string `json:"category"`
+}
+
+// NeedsUser reports whether a finding is parked for a human decision. An empty
+// or unrecognized action counts as needing a human, matching no-mistakes' own
+// fail-closed rule that an unclassified finding is never auto-fixed.
+func (f Finding) NeedsUser() bool {
+	switch strings.TrimSpace(f.Action) {
+	case "auto-fix", "no-op":
+		return false
+	default:
+		return true
+	}
+}
+
+// Location renders "file:line", or an empty string when the finding is not
+// pinned to one place.
+func (f Finding) Location() string {
+	if f.File == "" {
+		return ""
+	}
+	if f.Line > 0 {
+		return fmt.Sprintf("%s:%d", f.File, f.Line)
+	}
+	return f.File
 }
 
 // RepoName is the last path element of the repo's working directory, which is
@@ -221,10 +275,25 @@ func (r Run) Current() (Step, bool) {
 // Findings totals the findings recorded across every step of the run.
 func (r Run) Findings() (total, needsUser int) {
 	for _, s := range r.Steps {
-		total += s.Findings
+		total += s.FindingCount
 		needsUser += s.NeedsUser
 	}
 	return total, needsUser
+}
+
+// LatestLog returns the log file worth opening: the step the run is standing on
+// when it has written one, otherwise the last step that did. A step that has
+// just started has no log yet, and an empty pager is useless.
+func (r Run) LatestLog() (step Step, path string, ok bool) {
+	if current, found := r.Current(); found && current.LogPath != "" {
+		return current, current.LogPath, true
+	}
+	for i := len(r.Steps) - 1; i >= 0; i-- {
+		if r.Steps[i].LogPath != "" {
+			return r.Steps[i], r.Steps[i].LogPath, true
+		}
+	}
+	return Step{}, "", false
 }
 
 const runSelect = `
@@ -282,6 +351,12 @@ func (s *Store) Read(ctx context.Context, now time.Time, recentWindow time.Durat
 	if err := s.loadSteps(ctx, byID); err != nil {
 		return Snapshot{}, err
 	}
+
+	baselines, err := s.baselines(ctx, now)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snap.Baselines = baselines
 
 	for _, run := range order {
 		if run.Terminal() {
@@ -349,6 +424,7 @@ func (s *Store) loadSteps(ctx context.Context, runs map[string]*Run) error {
 		}
 		step.AgentPID = int(agentPID.Int64)
 		step.Findings, step.NeedsUser, step.Summary = parseFindings(findingsJSON)
+		step.FindingCount = len(step.Findings)
 		if run, ok := runs[runID]; ok {
 			run.Steps = append(run.Steps, step)
 		}
@@ -362,35 +438,77 @@ func (s *Store) loadSteps(ctx context.Context, runs map[string]*Run) error {
 	return nil
 }
 
+// baselineWindow is how far back to learn typical step durations. Long enough
+// to have samples for slow steps, short enough that a project's habits from
+// last quarter do not distort today's estimate.
+const baselineWindow = 30 * 24 * time.Hour
+
+const baselineSelect = `
+SELECT p.working_path, s.step_name, s.duration_ms
+FROM step_results s
+JOIN runs r ON r.id = s.run_id
+JOIN repos p ON p.id = r.repo_id
+WHERE s.status = 'completed' AND s.duration_ms > 0 AND r.created_at >= ?`
+
+// baselines learns the median duration of every step in every repo. The median,
+// not the mean: one CI step that sat for six hours waiting on a merge should not
+// move the estimate for the next twenty runs.
+func (s *Store) baselines(ctx context.Context, now time.Time) (Baselines, error) {
+	rows, err := s.db.QueryContext(ctx, baselineSelect, now.Add(-baselineWindow).Unix())
+	if err != nil {
+		return nil, fmt.Errorf("query baselines: %w", err)
+	}
+	defer rows.Close()
+
+	samples := map[string][]int64{}
+	for rows.Next() {
+		var (
+			repoPath string
+			stepName string
+			ms       int64
+		)
+		if err := rows.Scan(&repoPath, &stepName, &ms); err != nil {
+			return nil, fmt.Errorf("scan baseline: %w", err)
+		}
+		key := baselineKey(repoPath, stepName)
+		samples[key] = append(samples[key], ms)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make(Baselines, len(samples))
+	for key, values := range samples {
+		sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+		out[key] = time.Duration(values[len(values)/2]) * time.Millisecond
+	}
+	return out, nil
+}
+
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
 type findingsPayload struct {
-	Findings []struct {
-		Action string `json:"action"`
-	} `json:"findings"`
-	Summary string `json:"summary"`
+	Findings []Finding `json:"findings"`
+	Summary  string    `json:"summary"`
 }
 
-// parseFindings counts a step's findings. An empty or unrecognized action is
-// counted as needing a human, matching no-mistakes' own fail-closed rule that an
-// unclassified finding is never auto-fixed.
-func parseFindings(raw string) (total, needsUser int, summary string) {
+// parseFindings reads a step's recorded findings. Unparseable JSON yields no
+// findings rather than an error: a step's payload is written by an agent, and a
+// malformed one must not take down the whole refresh.
+func parseFindings(raw string) (findings []Finding, needsUser int, summary string) {
 	if strings.TrimSpace(raw) == "" {
-		return 0, 0, ""
+		return nil, 0, ""
 	}
 	var payload findingsPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-		return 0, 0, ""
+		return nil, 0, ""
 	}
 	for _, f := range payload.Findings {
-		total++
-		switch strings.TrimSpace(f.Action) {
-		case "auto-fix", "no-op":
-		default:
+		if f.NeedsUser() {
 			needsUser++
 		}
 	}
-	return total, needsUser, payload.Summary
+	return payload.Findings, needsUser, payload.Summary
 }

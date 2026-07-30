@@ -33,6 +33,9 @@ func run() error {
 		recent   = flag.Duration("recent", 6*time.Hour, "how far back to list finished runs")
 		limit    = flag.Int("recent-limit", 10, "maximum finished runs to list (0 for no limit)")
 		once     = flag.Bool("once", false, "print the table once and exit, for scripts and non-interactive shells")
+		notify   = flag.Bool("notify", true, "send a desktop notification when a run parks or fails")
+		trees    = flag.Bool("treehouse", true, "annotate runs with the treehouse worktree driving them, when treehouse is installed")
+		stall    = flag.Duration("stall", ui.DefaultStallAfter, "flag a running step that has reported nothing for this long")
 	)
 	flag.Parse()
 
@@ -62,6 +65,11 @@ func run() error {
 		RecentWindow: *recent,
 		RecentLimit:  *limit,
 		DBPath:       path,
+		// Both extras degrade to nothing when their tool is absent, so asking
+		// for them on a machine without them is not an error.
+		Notify:     *notify && ui.NotificationsAvailable(),
+		Treehouse:  *trees && ui.TreehouseAvailable(),
+		StallAfter: *stall,
 	}
 
 	if *once {

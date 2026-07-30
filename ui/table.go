@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -14,22 +15,22 @@ type sortMode int
 const (
 	// sortUrgency puts what needs you first: parked, then failed, then running.
 	sortUrgency sortMode = iota
+	// sortETA puts whatever is closest to finishing first.
+	sortETA
 	sortAge
 	sortRepo
 )
 
-func (s sortMode) String() string {
-	switch s {
-	case sortAge:
-		return "age"
-	case sortRepo:
-		return "repo"
-	default:
-		return "urgency"
-	}
+var sortNames = map[sortMode]string{
+	sortUrgency: "urgency",
+	sortETA:     "finishing next",
+	sortAge:     "age",
+	sortRepo:    "repo",
 }
 
-func (s sortMode) next() sortMode { return (s + 1) % 3 }
+func (s sortMode) String() string { return sortNames[s] }
+
+func (s sortMode) next() sortMode { return (s + 1) % 4 }
 
 // urgency ranks a run by how much it wants your attention. Lower sorts first.
 func urgency(run store.Run) int {
@@ -48,15 +49,27 @@ func urgency(run store.Run) int {
 }
 
 // sortRuns orders runs in place.
-func sortRuns(runs []store.Run, mode sortMode) {
+func sortRuns(runs []store.Run, mode sortMode, baselines store.Baselines, now time.Time) {
 	sort.SliceStable(runs, func(i, j int) bool {
 		a, b := runs[i], runs[j]
 		switch mode {
+		case sortETA:
+			left, leftOK := estimate(a, baselines, now)
+			right, rightOK := estimate(b, baselines, now)
+			// A run with no history to estimate from sorts last: it is unknown,
+			// not imminent.
+			if leftOK != rightOK {
+				return leftOK
+			}
+			if leftOK && left != right {
+				return left < right
+			}
+			return a.CreatedAt.After(b.CreatedAt)
 		case sortAge:
 			return a.CreatedAt.After(b.CreatedAt)
 		case sortRepo:
-			if a.RepoName() != b.RepoName() {
-				return a.RepoName() < b.RepoName()
+			if a.RepoPath != b.RepoPath {
+				return a.RepoPath < b.RepoPath
 			}
 			return a.Branch < b.Branch
 		default:
@@ -68,14 +81,54 @@ func sortRuns(runs []store.Run, mode sortMode) {
 	})
 }
 
-// columns holds the computed width of every table column.
+// repoLabels names each repository for the table. Two checkouts of the same
+// project share a basename, so when that happens the parent directory is added
+// to tell them apart; the full path is always on the detail page.
+func repoLabels(runs ...[]store.Run) map[string]string {
+	byBase := map[string][]string{}
+	for _, group := range runs {
+		for _, run := range group {
+			base := filepath.Base(run.RepoPath)
+			if !contains(byBase[base], run.RepoPath) {
+				byBase[base] = append(byBase[base], run.RepoPath)
+			}
+		}
+	}
+	out := map[string]string{}
+	for base, paths := range byBase {
+		for _, path := range paths {
+			if len(paths) == 1 {
+				out[path] = base
+				continue
+			}
+			out[path] = filepath.Join(filepath.Base(filepath.Dir(path)), base)
+		}
+	}
+	return out
+}
+
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+// columns holds the computed width of every table column, and which optional
+// columns fit or have anything to say.
 type columns struct {
-	repo   int
-	branch int
-	stages int
-	step   int
-	age    int
-	pr     int
+	repo    int
+	branch  int
+	stages  int
+	step    int
+	age     int
+	eta     int
+	tree    int
+	pr      int
+	showETA bool
+	showTH  bool
 }
 
 const (
@@ -83,27 +136,42 @@ const (
 	markerCols = 2
 	minBranch  = 12
 	minRepo    = 8
-	maxRepo    = 18
+	maxRepo    = 22
 	stepCols   = 13
 	ageCols    = 6
+	etaCols    = 8
+	treeCols   = 3
 	prCols     = 12
+	// etaMinWidth is the terminal width below which the estimate column is
+	// dropped: the branch name is worth more than the forecast.
+	etaMinWidth = 104
 )
 
 // layout divides the terminal width between the columns. Everything except the
 // branch is sized to its content; the branch absorbs whatever is left, because
 // it is the one column a human can still read half of.
-func layout(width, maxSteps, longestRepo int) columns {
-	repo := clamp(longestRepo, minRepo, maxRepo)
-	stages := maxSteps
-	if stages < 1 {
-		stages = 1
+func layout(width, maxSteps, longestRepo int, hasTreehouse bool) columns {
+	cols := columns{
+		repo:    clamp(longestRepo, minRepo, maxRepo),
+		stages:  maxInt(maxSteps, 1),
+		step:    stepCols,
+		age:     ageCols,
+		eta:     etaCols,
+		tree:    treeCols,
+		pr:      prCols,
+		showETA: width >= etaMinWidth,
+		showTH:  hasTreehouse,
 	}
-	fixed := markerCols + repo + gap + stages + gap + stepCols + gap + ageCols + gap + prCols + gap
-	branch := width - fixed
-	if branch < minBranch {
-		branch = minBranch
+
+	fixed := markerCols + cols.repo + gap + cols.stages + gap + cols.step + gap + cols.age + gap + cols.pr + gap
+	if cols.showETA {
+		fixed += cols.eta + gap
 	}
-	return columns{repo: repo, branch: branch, stages: stages, step: stepCols, age: ageCols, pr: prCols}
+	if cols.showTH {
+		fixed += cols.tree + gap
+	}
+	cols.branch = maxInt(width-fixed, minBranch)
+	return cols
 }
 
 func clamp(v, lo, hi int) int {
@@ -130,48 +198,57 @@ func maxStepCount(runs ...[]store.Run) int {
 	return most
 }
 
-func longestRepoName(runs ...[]store.Run) int {
+func longestLabel(labels map[string]string) int {
 	most := 0
-	for _, group := range runs {
-		for _, run := range group {
-			if n := len([]rune(run.RepoName())); n > most {
-				most = n
-			}
+	for _, label := range labels {
+		if n := len([]rune(label)); n > most {
+			most = n
 		}
 	}
 	return most
 }
 
+// rowContext is everything a row needs beyond the run itself.
+type rowContext struct {
+	cols      columns
+	labels    map[string]string
+	slots     map[string]string
+	stalls    map[string]stallKind
+	baselines store.Baselines
+	frame     int
+	now       time.Time
+}
+
 func headerRow(cols columns) string {
-	parts := []string{
+	cells := []string{
 		strings.Repeat(" ", markerCols),
 		cell("REPO", cols.repo),
 		cell("BRANCH", cols.branch),
 		cell("STAGES", cols.stages),
 		cell("STEP", cols.step),
 		cell("AGE", cols.age),
-		cell("PR", cols.pr),
 	}
-	return sHeader.Render(joinCells(parts))
+	if cols.showETA {
+		cells = append(cells, cell("LEFT", cols.eta))
+	}
+	if cols.showTH {
+		cells = append(cells, cell("TH", cols.tree))
+	}
+	cells = append(cells, cell("PR", cols.pr))
+	return sHeader.Render(joinCells(cells))
 }
 
-func joinCells(parts []string) string {
-	return strings.TrimRight(parts[0]+strings.Join(parts[1:], strings.Repeat(" ", gap)), " ")
+func joinCells(cells []string) string {
+	return strings.TrimRight(cells[0]+strings.Join(cells[1:], strings.Repeat(" ", gap)), " ")
 }
 
 // renderRow renders one run as a table line.
-func renderRow(run store.Run, cols columns, frame int, now time.Time, selected bool) string {
+func renderRow(run store.Run, ctx rowContext, selected bool) string {
+	cols := ctx.cols
 	marker := "  "
 	if selected {
 		marker = sSelected.Render("▸ ")
 	}
-
-	repo := cell(run.RepoName(), cols.repo)
-	branch := cell(shortBranch(run.Branch), cols.branch)
-	stages := renderStages(run.Steps, frame, cols.stages)
-	step := cell(stepLabel(run), cols.step)
-	ageCell := cell(age(runAge(run, now)), cols.age)
-	pr := prLabel(run)
 
 	repoStyle, branchStyle := sText, sText
 	if run.Terminal() {
@@ -181,14 +258,60 @@ func renderRow(run store.Run, cols columns, frame int, now time.Time, selected b
 		branchStyle = sBold.Foreground(colorAccent)
 	}
 
-	line := marker +
-		repoStyle.Render(repo) + strings.Repeat(" ", gap) +
-		branchStyle.Render(branch) + strings.Repeat(" ", gap) +
-		stages + strings.Repeat(" ", gap) +
-		runStyle(run.Status, run.Parked()).Render(step) + strings.Repeat(" ", gap) +
-		sDim.Render(ageCell) + strings.Repeat(" ", gap) +
-		prStyle(run.PRState).Render(cell(pr, cols.pr))
-	return strings.TrimRight(line, " ")
+	label := ctx.labels[run.RepoPath]
+	if label == "" {
+		label = run.RepoName()
+	}
+
+	cells := []string{
+		marker,
+		repoStyle.Render(cell(label, cols.repo)),
+		branchStyle.Render(cell(shortBranch(run.Branch), cols.branch)),
+		renderStages(run.Steps, ctx.frame, cols.stages),
+		stepCellStyle(run, ctx.stalls[run.ID]).Render(cell(stepCellText(run, ctx.stalls[run.ID]), cols.step)),
+		sDim.Render(cell(age(runAge(run, ctx.now)), cols.age)),
+	}
+	if cols.showETA {
+		cells = append(cells, etaStyle(run).Render(cell(etaCellText(run, ctx.stalls[run.ID], ctx.baselines, ctx.now), cols.eta)))
+	}
+	if cols.showTH {
+		cells = append(cells, sDim.Render(cell(ctx.slots[run.ID], cols.tree)))
+	}
+	cells = append(cells, prStyle(run.PRState).Render(cell(prLabel(run), cols.pr)))
+
+	return joinCells(cells)
+}
+
+// stepCellText flags a wedged run right where you read its progress.
+func stepCellText(run store.Run, stall stallKind) string {
+	if stall == stallNone {
+		return stepLabel(run)
+	}
+	return stepLabel(run) + " ⚠"
+}
+
+func stepCellStyle(run store.Run, stall stallKind) lipglossStyle {
+	if stall != stallNone {
+		return sRed
+	}
+	return runStyle(run.Status, run.Parked())
+}
+
+// etaStyle keeps "waiting on you" visually distinct from a countdown.
+func etaStyle(run store.Run) lipglossStyle {
+	if run.Parked() {
+		return sYellow
+	}
+	return sDim
+}
+
+// etaCellText replaces the countdown for a wedged run: it is not going to
+// finish in any amount of time, so a forecast would be a lie.
+func etaCellText(run store.Run, stall stallKind, baselines store.Baselines, now time.Time) string {
+	if stall != stallNone {
+		return "stuck"
+	}
+	return etaLabel(run, baselines, now)
 }
 
 // renderStages colors each stage glyph individually, so one line shows the

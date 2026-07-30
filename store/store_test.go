@@ -277,9 +277,9 @@ func TestParseFindings(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			total, needsUser, summary := parseFindings(tc.raw)
-			if total != tc.total || needsUser != tc.needsUser {
-				t.Errorf("got total=%d needsUser=%d, want %d/%d", total, needsUser, tc.total, tc.needsUser)
+			findings, needsUser, summary := parseFindings(tc.raw)
+			if len(findings) != tc.total || needsUser != tc.needsUser {
+				t.Errorf("got total=%d needsUser=%d, want %d/%d", len(findings), needsUser, tc.total, tc.needsUser)
 			}
 			if summary != tc.wantSummaryIs {
 				t.Errorf("summary = %q, want %q", summary, tc.wantSummaryIs)

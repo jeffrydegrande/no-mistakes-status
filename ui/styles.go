@@ -2,6 +2,10 @@ package ui
 
 import "github.com/charmbracelet/lipgloss"
 
+// lipglossStyle is an alias so the rest of the package can name a style without
+// importing lipgloss into every file.
+type lipglossStyle = lipgloss.Style
+
 // Colors are adaptive so the dashboard stays readable on light and dark
 // terminals without a config file.
 var (

@@ -162,7 +162,8 @@ func TestSortKeyCyclesAndReorders(t *testing.T) {
 		t.Fatalf("default sort = %s first, want the parked run", m.runs[0].ID)
 	}
 
-	m = press(t, m, "s") // urgency -> age
+	m = press(t, m, "s") // urgency -> finishing next
+	m = press(t, m, "s") // finishing next -> age
 	if m.sort != sortAge {
 		t.Fatalf("sort = %s, want age", m.sort)
 	}

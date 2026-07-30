@@ -8,6 +8,17 @@ import (
 	"github.com/jeffrydegrande/no-mistakes-status/store"
 )
 
+// testRowContext builds the surrounding state a row needs, with the repo
+// labels derived the same way the model derives them.
+func testRowContext(cols columns) rowContext {
+	return rowContext{
+		cols:   cols,
+		labels: map[string]string{},
+		slots:  map[string]string{},
+		now:    time.Unix(2000, 0),
+	}
+}
+
 func testRun(id, repo, branch, status string) store.Run {
 	return store.Run{
 		ID:        id,
@@ -33,7 +44,7 @@ func TestSortUrgencyPutsWhatNeedsYouOnTop(t *testing.T) {
 	parked.ParkedSince = time.Unix(900, 0)
 
 	runs := []store.Run{pending, running, failed, parked}
-	sortRuns(runs, sortUrgency)
+	sortRuns(runs, sortUrgency, nil, testNow)
 
 	var got []string
 	for _, r := range runs {
@@ -54,7 +65,7 @@ func TestSortAgeIsNewestFirst(t *testing.T) {
 	newer.CreatedAt = time.Unix(999, 0)
 
 	runs := []store.Run{older, newer}
-	sortRuns(runs, sortAge)
+	sortRuns(runs, sortAge, nil, testNow)
 	if runs[0].ID != "new" {
 		t.Errorf("age sort = %s first, want the newest run", runs[0].ID)
 	}
@@ -66,7 +77,7 @@ func TestSortRepoGroupsProjects(t *testing.T) {
 		testRun("2", "alpha", "z-branch", "running"),
 		testRun("3", "alpha", "a-branch", "running"),
 	}
-	sortRuns(runs, sortRepo)
+	sortRuns(runs, sortRepo, nil, testNow)
 	if runs[0].ID != "3" || runs[1].ID != "2" || runs[2].ID != "1" {
 		t.Errorf("repo sort = %s %s %s, want alpha/a-branch, alpha/z-branch, zebra", runs[0].ID, runs[1].ID, runs[2].ID)
 	}
@@ -75,14 +86,14 @@ func TestSortRepoGroupsProjects(t *testing.T) {
 func TestSortModeCycles(t *testing.T) {
 	mode := sortUrgency
 	seen := map[string]bool{}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		seen[mode.String()] = true
 		mode = mode.next()
 	}
 	if mode != sortUrgency {
 		t.Error("sort mode should cycle back to urgency")
 	}
-	for _, want := range []string{"urgency", "age", "repo"} {
+	for _, want := range []string{"urgency", "finishing next", "age", "repo"} {
 		if !seen[want] {
 			t.Errorf("sort cycle never reached %q", want)
 		}
@@ -91,10 +102,13 @@ func TestSortModeCycles(t *testing.T) {
 
 func TestLayoutFitsTheTerminal(t *testing.T) {
 	for _, w := range []int{60, 80, 100, 140, 200} {
-		cols := layout(w, 10, 13)
+		cols := layout(w, 10, 13, true)
 		total := markerCols + cols.repo + gap + cols.branch + gap + cols.stages + gap +
-			cols.step + gap + cols.age + gap + cols.pr
-		if w >= 90 && total > w {
+			cols.step + gap + cols.age + gap + cols.eta + gap + cols.tree + gap + cols.pr
+		if !cols.showETA {
+			total -= cols.eta + gap
+		}
+		if w >= etaMinWidth && total > w {
 			t.Errorf("width %d: columns total %d, wider than the terminal", w, total)
 		}
 		if cols.branch < minBranch {
@@ -114,8 +128,8 @@ func TestLayoutSizesStagesToTheWidestRun(t *testing.T) {
 	if got := maxStepCount(runs, []store.Run{wide}); got != 4 {
 		t.Errorf("maxStepCount = %d, want 4 (the widest run wins so strips align)", got)
 	}
-	if got := longestRepoName(runs); got != len("repo") {
-		t.Errorf("longestRepoName = %d", got)
+	if got := longestLabel(repoLabels(runs)); got != len("repo") {
+		t.Errorf("longestLabel = %d", got)
 	}
 }
 
@@ -125,8 +139,8 @@ func TestRenderRowStaysInsideTheTerminal(t *testing.T) {
 	run.PRState = "open"
 
 	for _, w := range []int{80, 100, 160} {
-		cols := layout(w, 3, 7)
-		line := plain(renderRow(run, cols, 0, time.Unix(2000, 0), false))
+		ctx := testRowContext(layout(w, 3, 7, false))
+		line := plain(renderRow(run, ctx, false))
 		if len([]rune(line)) > w {
 			t.Errorf("width %d: row is %d cells wide: %q", w, len([]rune(line)), line)
 		}
@@ -141,9 +155,9 @@ func TestRenderRowStaysInsideTheTerminal(t *testing.T) {
 
 func TestRenderRowMarksTheSelectedRun(t *testing.T) {
 	run := testRun("a", "repo", "b", "running")
-	cols := layout(100, 3, 6)
-	selected := plain(renderRow(run, cols, 0, time.Unix(2000, 0), true))
-	unselected := plain(renderRow(run, cols, 0, time.Unix(2000, 0), false))
+	ctx := testRowContext(layout(100, 3, 6, false))
+	selected := plain(renderRow(run, ctx, true))
+	unselected := plain(renderRow(run, ctx, false))
 
 	if !strings.HasPrefix(selected, "▸ ") {
 		t.Errorf("selected row = %q, want a leading marker", selected)
@@ -157,10 +171,10 @@ func TestRenderRowMarksTheSelectedRun(t *testing.T) {
 }
 
 func TestHeaderRowMatchesColumnWidths(t *testing.T) {
-	cols := layout(120, 10, 13)
+	cols := layout(120, 10, 13, true)
 	header := plain(headerRow(cols))
 	run := testRun("a", "nova-go", "user/branch", "running")
-	row := plain(renderRow(run, cols, 0, time.Unix(2000, 0), false))
+	row := plain(renderRow(run, testRowContext(cols), false))
 
 	// The STAGES header must start where the stage glyphs start, or the table
 	// reads as misaligned even though every cell is padded correctly.
