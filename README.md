@@ -30,6 +30,7 @@ go install github.com/jeffrydegrande/no-mistakes-status/cmd/nms@latest
 ```sh
 nms                 # live dashboard, refreshes every 5s
 nms --once          # print the table once and exit (pipe-friendly)
+nms --json          # print active and recent runs once as JSON, for scripts
 nms --interval 2s   # poll faster
 nms --recent 24h    # look further back for finished runs
 nms --stall 15m     # be more patient before calling a step stuck
