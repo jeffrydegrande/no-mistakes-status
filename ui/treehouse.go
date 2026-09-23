@@ -4,7 +4,6 @@ import (
 	"context"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/jeffrydegrande/no-mistakes-status/store"
 )
@@ -22,11 +21,6 @@ type lease struct {
 	slot   string
 	holder string
 }
-
-// treehouseInterval is how often to re-read the pool. Leases change when an
-// agent picks up or finishes a task, which is minutes apart, and the status
-// command walks every worktree's process tree.
-const treehouseInterval = 30 * time.Second
 
 // treehouseCommand runs the pool status for one repository. It is a variable so
 // tests do not need treehouse installed.
