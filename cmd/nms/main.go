@@ -33,6 +33,7 @@ func run() error {
 		recent   = flag.Duration("recent", 6*time.Hour, "how far back to list finished runs")
 		limit    = flag.Int("recent-limit", 10, "maximum finished runs to list (0 for no limit)")
 		once     = flag.Bool("once", false, "print the table once and exit, for scripts and non-interactive shells")
+		asJSON   = flag.Bool("json", false, "print active and recent runs once as JSON and exit")
 		notify   = flag.Bool("notify", true, "send a desktop notification when a run parks or fails")
 		trees    = flag.Bool("treehouse", true, "annotate runs with the treehouse worktree driving them, when treehouse is installed")
 		stall    = flag.Duration("stall", ui.DefaultStallAfter, "flag a running step that has reported nothing for this long")
@@ -72,6 +73,9 @@ func run() error {
 		StallAfter: *stall,
 	}
 
+	if *asJSON {
+		return ui.PrintJSON(ctx, os.Stdout, st, opts)
+	}
 	if *once {
 		return ui.PrintOnce(ctx, os.Stdout, st, opts)
 	}

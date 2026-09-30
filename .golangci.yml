@@ -1,0 +1,11 @@
+version: "2"
+linters:
+  settings:
+    errcheck:
+      # Closing read-only handles cannot lose data.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - (*github.com/jeffrydegrande/no-mistakes-status/store.Store).Close

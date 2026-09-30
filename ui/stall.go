@@ -101,11 +101,6 @@ func (s stallCheck) idle(step store.Step) time.Duration {
 	}
 }
 
-func (s stallCheck) stalled(run store.Run) bool {
-	kind, _ := s.classify(run)
-	return kind != stallNone
-}
-
 // processAlive reports whether a process id is still running. Signal 0 performs
 // the permission and existence checks without delivering anything.
 func processAlive(pid int) bool {
